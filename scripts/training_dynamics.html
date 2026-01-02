@@ -159,6 +159,7 @@
 
       let rows = [];
       let chart = null;
+      let currentFolder = null;
 
       async function fetchNoCache(url) {
         return fetch(url + (url.includes("?") ? "&" : "?") + "_=" + Date.now(), { cache: "no-store" });
@@ -234,14 +235,32 @@
         }
       }
 
+      function updateMetricOptions() {
+        const sel = $("metricSel");
+        const cur = sel.value;
+        const keys = new Set();
+        for (const r of rows) {
+          for (const k of Object.keys(r)) {
+            if (k === "step" || k === "hf_repo") continue;
+            keys.add(k);
+          }
+        }
+        const metrics = [...keys].sort();
+        if (!metrics.length) return;
+        sel.innerHTML = metrics.map((k) => `<option value="${k}">${k}</option>`).join("");
+        sel.value = metrics.includes(cur) ? cur : metrics[0];
+      }
+
       async function loadSweep(folder) {
         $("status").textContent = "Loading…";
+        currentFolder = folder;
         // Prefer CSV
         let r = await fetchNoCache(`${folder}/sweep_results.csv`);
         if (r.ok) {
           const text = await r.text();
           rows = parseCsv(text);
           $("status").textContent = `Loaded ${rows.length} rows from sweep_results.csv`;
+          updateMetricOptions();
           return;
         }
         // Fallback: jsonl
@@ -255,6 +274,7 @@
           .filter((l) => l.trim().length)
           .map((l) => JSON.parse(l));
         $("status").textContent = `Loaded ${rows.length} rows from sweep_results.jsonl`;
+        updateMetricOptions();
       }
 
       $("loadBtn").addEventListener("click", async () => {
@@ -277,6 +297,17 @@
           $("status").textContent = "Enter a sweep folder like sweeps/<sweep_id> and click Load.";
         }
       })();
+
+      // Auto-refresh every 10s when a sweep is loaded.
+      setInterval(async () => {
+        if (!currentFolder) return;
+        try {
+          await loadSweep(currentFolder);
+          render($("metricSel").value);
+        } catch (e) {
+          // ignore transient errors
+        }
+      }, 10000);
     </script>
   </body>
 </html>

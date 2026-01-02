@@ -72,6 +72,13 @@
         color: var(--text);
         min-width: 320px;
       }
+      select {
+        background: rgba(255, 255, 255, 0.06);
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        padding: 10px 12px;
+        color: var(--text);
+      }
       button {
         background: rgba(61, 220, 151, 0.12);
         border: 1px solid rgba(61, 220, 151, 0.35);
@@ -339,6 +346,9 @@
             <div class="row" style="align-items: center; margin-top: 6px">
               <input id="runInput" type="text" class="mono" placeholder="runs/20251229_130000_model" />
               <button id="loadBtn">Load</button>
+              <select id="stepSel" class="mono" title="Select checkpoint step">
+                <option value="latest">latest</option>
+              </select>
               <span id="status" class="muted small"></span>
             </div>
             <div class="muted small" style="margin-top: 8px">
@@ -455,11 +465,14 @@
       nowClock();
 
       let basePath = null;
-      let lastCompleted = -1;
+      let lastSig = null;
       let records = [];
       let recordByIndex = new Map();
       let selectedIndex = null;
       let derivedAgg = null;
+      let selectedStep = "latest"; // "latest" or a numeric string
+      let lastIndexSig = null;
+      let cachedIndex = null;
 
       const DISPLAY_KS = [8, 16, 32, 64, 128, 256];
 
@@ -506,13 +519,70 @@
         basePath = p.replace(/\/+$/, "");
         $("status").textContent = `Loading from ${basePath}`;
         $("runInput").value = basePath;
-        lastCompleted = -1;
+        lastSig = null;
         records = [];
         recordByIndex = new Map();
         derivedAgg = null;
         selectedIndex = null;
         $("details").textContent = "Select a sample above.";
         await tick(); // immediate
+      }
+
+      function normalizeStep(s) {
+        if (!s) return "latest";
+        if (s === "latest") return "latest";
+        const n = parseInt(String(s), 10);
+        return Number.isFinite(n) ? String(n) : "latest";
+      }
+
+      function dataBasePath() {
+        if (!basePath) return null;
+        if (!selectedStep || selectedStep === "latest") return basePath;
+        return join(basePath, `steps/${selectedStep}`);
+      }
+
+      async function fetchIndex() {
+        if (!basePath) return null;
+        try {
+          const r = await fetchNoCache(join(basePath, "index.json"));
+          if (!r.ok) return null;
+          return await r.json();
+        } catch (e) {
+          return null;
+        }
+      }
+
+      function setQueryParam(key, value) {
+        const url = new URL(window.location.href);
+        if (value === null || value === undefined || value === "") url.searchParams.delete(key);
+        else url.searchParams.set(key, value);
+        window.history.replaceState({}, "", url.toString());
+      }
+
+      async function refreshStepSelector() {
+        const idx = await fetchIndex();
+        if (!idx) return;
+
+        const steps = Array.isArray(idx.steps) ? idx.steps.map((x) => parseInt(x, 10)).filter(Number.isFinite) : [];
+        steps.sort((a, b) => a - b);
+        const latest = idx.latest_step !== undefined && idx.latest_step !== null ? parseInt(idx.latest_step, 10) : null;
+        const sig = `${steps.join(",")}|${latest ?? ""}`;
+        if (sig === lastIndexSig) return;
+        lastIndexSig = sig;
+        cachedIndex = { steps, latest };
+
+        const sel = $("stepSel");
+        const cur = sel.value;
+        const opts = [];
+        if (latest !== null && Number.isFinite(latest)) opts.push({ v: "latest", t: `latest (step ${latest})` });
+        else opts.push({ v: "latest", t: "latest" });
+        for (const s of steps) opts.push({ v: String(s), t: String(s) });
+        sel.innerHTML = opts.map((o) => `<option value="${o.v}">${o.t}</option>`).join("");
+
+        // Keep selection if possible; otherwise fall back to latest.
+        const wanted = normalizeStep(cur);
+        const allowed = new Set(opts.map((o) => o.v));
+        sel.value = allowed.has(wanted) ? wanted : "latest";
       }
 
       function renderProgress(prog) {
@@ -1202,14 +1272,19 @@
       }
 
       async function fetchProgress() {
-        const r = await fetchNoCache(join(basePath, "progress.json"));
+        const p = dataBasePath();
+        if (!p) throw new Error("basePath not set");
+        const r = await fetchNoCache(join(p, "progress.json"));
         if (!r.ok) throw new Error(`progress.json fetch failed: ${r.status}`);
         return r.json();
       }
 
-      async function fetchResultsIfNeeded(completed) {
-        if (completed === lastCompleted) return;
-        const r = await fetchNoCache(join(basePath, "results.jsonl"));
+      async function fetchResultsIfNeeded(prog) {
+        const sig = prog && (prog.signature ?? prog.completed ?? 0);
+        if (sig === lastSig) return;
+        const p = dataBasePath();
+        if (!p) return;
+        const r = await fetchNoCache(join(p, "results.jsonl"));
         if (!r.ok) return;
         const text = await r.text();
         const lines = text.split("\n").filter((ln) => ln.trim().length);
@@ -1221,7 +1296,7 @@
         }
         records = parsed;
         recordByIndex = new Map(records.map((r) => [r.sample_index, r]));
-        lastCompleted = completed;
+        lastSig = sig;
         derivedAgg = computeAggregateFromRecords(records);
         renderSamplesTable();
         if (selectedIndex !== null && recordByIndex.has(selectedIndex)) {
@@ -1232,11 +1307,14 @@
       async function tick() {
         if (!basePath) return;
         try {
+          // Keep step list fresh (if index.json exists).
+          await refreshStepSelector();
           const prog = await fetchProgress();
           renderProgress(prog);
-          await fetchResultsIfNeeded(prog.completed || 0);
+          await fetchResultsIfNeeded(prog);
           renderMetrics(derivedAgg || prog.aggregate);
-          $("status").textContent = `OK · ${basePath}`;
+          const stepLabel = selectedStep === "latest" ? "latest" : `step ${selectedStep}`;
+          $("status").textContent = `OK · ${basePath} · ${stepLabel}`;
         } catch (e) {
           $("status").textContent = `Waiting for run… (${e})`;
         }
@@ -1245,7 +1323,22 @@
       $("loadBtn").addEventListener("click", async () => {
         const p = $("runInput").value.trim();
         if (!p) return;
+        selectedStep = "latest";
+        setQueryParam("run", p);
+        setQueryParam("step", "latest");
         await loadBasePath(p);
+      });
+
+      $("stepSel").addEventListener("change", async () => {
+        selectedStep = normalizeStep($("stepSel").value);
+        lastSig = null;
+        records = [];
+        recordByIndex = new Map();
+        derivedAgg = null;
+        selectedIndex = null;
+        $("details").textContent = "Select a sample above.";
+        setQueryParam("step", selectedStep);
+        await tick();
       });
 
       (async () => {
@@ -1254,6 +1347,9 @@
           $("status").textContent = "Could not auto-detect a run. Enter a run path above.";
           return;
         }
+        const qs = new URLSearchParams(window.location.search);
+        selectedStep = normalizeStep(qs.get("step") || "latest");
+        $("stepSel").value = selectedStep;
         await loadBasePath(initial);
         setInterval(tick, 1000);
       })();
