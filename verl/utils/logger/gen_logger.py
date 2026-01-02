@@ -61,22 +61,17 @@ class WandbGenerationLogger(GenerationLogger):
             [],
         )
 
-        if not hasattr(self, "validation_table"):
-            # Initialize the table on first call
-            self.validation_table = wandb.Table(columns=columns)
+        # NOTE: We intentionally create an independent table per step/checkpoint.
+        # This avoids accumulating rows across checkpoints and keeps each logged table self-contained.
+        table = wandb.Table(columns=columns)
 
-        # Create a new table with same columns and existing data
-        # Workaround for https://github.com/wandb/wandb/issues/2981#issuecomment-1997445737
-        new_table = wandb.Table(columns=columns, data=self.validation_table.data)
-
-        # Add new row with all data
+        # Add one row with all data for this step
         row_data = [step]
         for sample in samples:
             row_data.extend(sample)
 
-        new_table.add_data(*row_data)
-        wandb.log({"val/generations": new_table}, step=step)
-        self.validation_table = new_table
+        table.add_data(*row_data)
+        wandb.log({"val/generations": table}, step=step)
 
 
 @dataclass

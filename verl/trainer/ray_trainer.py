@@ -39,7 +39,7 @@ from ..single_controller.ray.base import create_colocated_worker_cls
 from ..utils import torch_functional as VF
 from ..utils.checkpoint import CHECKPOINT_TRACKER, find_latest_ckpt, remove_obsolete_ckpt
 from ..utils.logger import Tracker
-from ..utils.py_functional import convert_dict_to_str, timer, unflatten_dict
+from ..utils.py_functional import convert_dict_to_str, is_package_available, timer, unflatten_dict
 from ..utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from ..workers.fsdp_workers import FSDPWorker
 from ..workers.reward import AutoRewardManager
@@ -59,6 +59,9 @@ from .metrics import (
     compute_timing_metrics,
     reduce_metrics,
 )
+
+if is_package_available("wandb"):
+    import wandb  # type: ignore
 
 
 class Role(IntEnum):
@@ -404,73 +407,217 @@ class RayPPOTrainer:
         if self.config.trainer.val_generations_to_log <= 0:
             return
 
-        # Create tuples of (input, output, score) and sort by input text
+        # Keep the original generation order (no sorting/shuffling),
+        # so the logged outputs match the raw rollout ordering.
         samples = list(zip(inputs, outputs, labels, scores))
-        samples.sort(key=lambda x: x[0])  # Sort by input text
-
-        # Use fixed random seed for deterministic shuffling
-        rng = np.random.RandomState(42)
-        rng.shuffle(samples)
-
         samples = samples[: self.config.trainer.val_generations_to_log]
         self.logger.log_generation(samples, self.global_step)
 
     def _validate(self) -> dict[str, Any]:
-        reward_tensor_lst = []
-        # Lists to collect samples for the table
-        sample_inputs, sample_outputs, sample_labels, sample_scores = [], [], [], []
-        reward_metrics_lst = defaultdict(list)
-        length_metrics_lst = defaultdict(list)
+        def _run_val_pass(meta_override: dict[str, Any]) -> tuple[
+            int,
+            list[str],
+            list[str],
+            list[Any],
+            list[float],
+            list[torch.Tensor],
+            dict[str, list[Any]],
+            dict[str, list[Any]],
+        ]:
+            """Run a full validation pass with a specific sampling meta_override.
+
+            Returns:
+                repeat_times, sample_inputs, sample_outputs, sample_labels, sample_scores,
+                reward_tensor_lst, reward_metrics_lst, length_metrics_lst
+            """
+            repeat_times = int(meta_override.get("n", 1))
+            reward_tensor_lst: list[torch.Tensor] = []
+            sample_inputs: list[str] = []
+            sample_outputs: list[str] = []
+            sample_labels: list[Any] = []
+            sample_scores: list[float] = []
+            reward_metrics_lst: dict[str, list[Any]] = defaultdict(list)
+            length_metrics_lst: dict[str, list[Any]] = defaultdict(list)
+
+            for batch_dict in self.val_dataloader:
+                test_batch = DataProto.from_single_dict(batch_dict)
+                test_gen_batch = test_batch.pop(
+                    batch_keys=["input_ids", "attention_mask", "position_ids"],
+                    non_tensor_batch_keys=["raw_prompt_ids", "multi_modal_data"],
+                )
+
+                # Always copy to avoid mutating config dicts.
+                test_gen_batch.meta_info = dict(meta_override)
+                test_gen_batch.meta_info["min_pixels"] = self.config.data.min_pixels
+                test_gen_batch.meta_info["max_pixels"] = self.config.data.max_pixels
+                test_gen_batch.meta_info["video_fps"] = self.config.data.video_fps
+
+                test_gen_batch, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.actor_rollout_ref_wg.world_size)
+                test_output_gen_batch = self.actor_rollout_ref_wg.generate_sequences(test_gen_batch)
+                test_output_gen_batch = unpad_dataproto(test_output_gen_batch, pad_size=pad_size * repeat_times)
+
+                # repeat to align with repeated responses in rollout (n > 1)
+                test_batch = test_batch.repeat(repeat_times=repeat_times, interleave=True)
+                test_batch = test_batch.union(test_output_gen_batch)
+
+                # evaluate using reward_function
+                reward_tensor, reward_metrics = ray.get(self.val_reward_fn.compute_reward.remote(test_batch))
+
+                # store generations (keep original order from rollout)
+                input_ids = test_batch.batch["prompts"]
+                input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
+                output_ids = test_batch.batch["responses"]
+                output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
+                scores = reward_tensor.sum(-1).cpu().tolist()
+
+                sample_inputs.extend(input_texts)
+                sample_outputs.extend(output_texts)
+                sample_labels.extend(test_batch.non_tensor_batch["ground_truth"].tolist())
+                sample_scores.extend(scores)
+
+                reward_tensor_lst.append(reward_tensor)
+                for key, value in reward_metrics.items():
+                    reward_metrics_lst[key].extend(value)
+
+                for key, value in compute_length_metrics(test_batch).items():
+                    length_metrics_lst[key].append(value)
+
+            return (
+                repeat_times,
+                sample_inputs,
+                sample_outputs,
+                sample_labels,
+                sample_scores,
+                reward_tensor_lst,
+                reward_metrics_lst,
+                length_metrics_lst,
+            )
+
         print("Start validation...")
         self.actor_rollout_ref_wg.prepare_rollout_engine()
-        for batch_dict in self.val_dataloader:
-            test_batch = DataProto.from_single_dict(batch_dict)
-            test_gen_batch = test_batch.pop(
-                batch_keys=["input_ids", "attention_mask", "position_ids"],
-                non_tensor_batch_keys=["raw_prompt_ids", "multi_modal_data"],
-            )
-            repeat_times = self.config.worker.rollout.val_override_config.get("n", 1)
-            test_gen_batch.meta_info = self.config.worker.rollout.val_override_config
-            test_gen_batch.meta_info["min_pixels"] = self.config.data.min_pixels
-            test_gen_batch.meta_info["max_pixels"] = self.config.data.max_pixels
-            test_gen_batch.meta_info["video_fps"] = self.config.data.video_fps
+        try:
+            # ------------------------------------------------------------
+            # 1) temp=0 pass@1 (always run before any pass@k evaluation)
+            # ------------------------------------------------------------
+            pass1_meta = dict(self.config.worker.rollout.val_override_config)
+            pass1_meta["temperature"] = 0
+            pass1_meta["n"] = 1
 
-            test_gen_batch, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.actor_rollout_ref_wg.world_size)
-            test_output_gen_batch = self.actor_rollout_ref_wg.generate_sequences(test_gen_batch)
-            test_output_gen_batch = unpad_dataproto(test_output_gen_batch, pad_size=pad_size * repeat_times)
+            (
+                _pass1_repeat,
+                pass1_inputs,
+                pass1_outputs,
+                pass1_labels,
+                pass1_scores,
+                pass1_reward_tensor_lst,
+                pass1_reward_metrics_lst,
+                pass1_length_metrics_lst,
+            ) = _run_val_pass(pass1_meta)
 
-            # repeat to align with repeated responses in rollout
-            test_batch = test_batch.repeat(repeat_times=repeat_times, interleave=True)
-            test_batch = test_batch.union(test_output_gen_batch)
+            # Keep existing behavior: log a small sample of generations (order-preserving).
+            self._maybe_log_val_generations(pass1_inputs, pass1_outputs, pass1_labels, pass1_scores)
 
-            # evaluate using reward_function
-            reward_tensor, reward_metrics = ray.get(self.val_reward_fn.compute_reward.remote(test_batch))
+            # Scalar validation metrics (based on temp=0 pass@1)
+            self.val_reward_score = torch.cat(pass1_reward_tensor_lst, dim=0).sum(-1).mean().item()
+            val_reward_metrics = {
+                f"val/{key}_reward": value for key, value in reduce_metrics(pass1_reward_metrics_lst).items()
+            }
+            val_length_metrics = {
+                f"val_{key}": value for key, value in reduce_metrics(pass1_length_metrics_lst).items()
+            }
+            metrics: dict[str, Any] = {"val/reward_score": self.val_reward_score, **val_reward_metrics, **val_length_metrics}
 
-            # store generations
-            input_ids = test_batch.batch["prompts"]
-            input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
-            output_ids = test_batch.batch["responses"]
-            output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
-            scores = reward_tensor.sum(-1).cpu().tolist()
-            sample_inputs.extend(input_texts)
-            sample_outputs.extend(output_texts)
-            sample_labels.extend(test_batch.non_tensor_batch["ground_truth"].tolist())
-            sample_scores.extend(scores)
+            # pass@1(temp=0) scalar + table
+            pass1_acc_key = "accuracy" if "accuracy" in pass1_reward_metrics_lst else "overall"
+            pass1_vals = [0.0 if v is None else float(v) for v in pass1_reward_metrics_lst.get(pass1_acc_key, [])]
+            if len(pass1_vals) > 0:
+                metrics["val/pass@1_temp0"] = float(np.mean(pass1_vals))
 
-            reward_tensor_lst.append(reward_tensor)
-            for key, value in reward_metrics.items():
-                reward_metrics_lst[key].extend(value)
+            if is_package_available("wandb"):
+                pass1_table = wandb.Table(
+                    columns=["step", "idx", "prompt", "output", "ground_truth", "pass@1"],
+                    data=[
+                        [self.global_step, i, inp, out, lab, pass1_vals[i] if i < len(pass1_vals) else None]
+                        for i, (inp, out, lab) in enumerate(zip(pass1_inputs, pass1_outputs, pass1_labels))
+                    ],
+                )
+                self.logger.log_wandb({"val/pass@1_table": pass1_table}, step=self.global_step)
 
-            for key, value in compute_length_metrics(test_batch).items():
-                length_metrics_lst[key].append(value)
+            # ------------------------------------------------------------
+            # 2) pass@k (k>=2) using sampling config (defaults to training rollout params)
+            # ------------------------------------------------------------
+            max_k = int(getattr(self.config.worker.rollout, "n", 1))
+            if max_k >= 2:
+                passk_meta: dict[str, Any] = {
+                    "temperature": self.config.worker.rollout.temperature,
+                    "top_p": self.config.worker.rollout.top_p,
+                    "top_k": self.config.worker.rollout.top_k,
+                    "seed": self.config.worker.rollout.seed,
+                    "n": max_k,
+                }
 
-        self.actor_rollout_ref_wg.release_rollout_engine()
-        self._maybe_log_val_generations(sample_inputs, sample_outputs, sample_labels, sample_scores)
-        self.val_reward_score = torch.cat(reward_tensor_lst, dim=0).sum(-1).mean().item()
-        val_reward_metrics = {f"val/{key}_reward": value for key, value in reduce_metrics(reward_metrics_lst).items()}
-        val_length_metrics = {f"val_{key}": value for key, value in reduce_metrics(length_metrics_lst).items()}
-        print("Finish validation.")
-        return {"val/reward_score": self.val_reward_score, **val_reward_metrics, **val_length_metrics}
+                (
+                    passk_repeat,
+                    passk_inputs,
+                    passk_outputs,
+                    passk_labels,
+                    _passk_scores,
+                    _passk_reward_tensor_lst,
+                    passk_reward_metrics_lst,
+                    _passk_length_metrics_lst,
+                ) = _run_val_pass(passk_meta)
+
+                # Prefer strict correctness if available.
+                passk_acc_key = "accuracy" if "accuracy" in passk_reward_metrics_lst else "overall"
+                passk_acc_vals = [0.0 if v is None else float(v) for v in passk_reward_metrics_lst.get(passk_acc_key, [])]
+
+                # Group by prompt (rollout outputs are contiguous per prompt).
+                num_prompts = len(passk_outputs) // passk_repeat if passk_repeat > 0 else 0
+                pass_ks = list(range(2, passk_repeat + 1))
+
+                # Compute scalar pass@k across the full val set.
+                for k in pass_ks:
+                    per_prompt = []
+                    for i in range(num_prompts):
+                        start = i * passk_repeat
+                        end = start + passk_repeat
+                        group_acc = passk_acc_vals[start:end]
+                        per_prompt.append(1.0 if any(a >= 1.0 for a in group_acc[:k]) else 0.0)
+                    if len(per_prompt) > 0:
+                        metrics[f"val/pass@{k}"] = float(np.mean(per_prompt))
+
+                # Log per-example pass@k table (independent per checkpoint/step).
+                if is_package_available("wandb"):
+                    columns = ["step", "idx", "prompt", "ground_truth"]
+                    for j in range(passk_repeat):
+                        columns.extend([f"output_{j + 1}", f"acc_{j + 1}"])
+                    for k in pass_ks:
+                        columns.append(f"pass@{k}")
+
+                    data = []
+                    for i in range(num_prompts):
+                        start = i * passk_repeat
+                        end = start + passk_repeat
+                        prompt = passk_inputs[start] if start < len(passk_inputs) else ""
+                        gt = passk_labels[start] if start < len(passk_labels) else ""
+                        outs = passk_outputs[start:end]
+                        accs = passk_acc_vals[start:end]
+
+                        row = [self.global_step, i, prompt, gt]
+                        for j in range(passk_repeat):
+                            row.append(outs[j] if j < len(outs) else "")
+                            row.append(accs[j] if j < len(accs) else None)
+                        for k in pass_ks:
+                            row.append(1.0 if any(a >= 1.0 for a in accs[:k]) else 0.0)
+                        data.append(row)
+
+                    passk_table = wandb.Table(columns=columns, data=data)
+                    self.logger.log_wandb({"val/pass@k_table": passk_table}, step=self.global_step)
+
+            print("Finish validation.")
+            return metrics
+        finally:
+            self.actor_rollout_ref_wg.release_rollout_engine()
 
     def _balance_batch(self, batch: DataProto, metrics: dict[str, Any], logging_prefix: str = "global_seqlen") -> None:
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""

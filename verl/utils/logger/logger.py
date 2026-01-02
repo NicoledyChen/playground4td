@@ -184,6 +184,17 @@ class Tracker:
     def log_generation(self, samples: list[tuple[str, str, str, float]], step: int) -> None:
         self.gen_logger.log(samples, step)
 
+    def log_wandb(self, data: dict[str, Any], step: int) -> None:
+        """Log data only to Weights & Biases (avoid breaking non-wandb loggers with non-JSON-serializable objects)."""
+        if not is_package_available("wandb"):
+            return
+
+        # Only log if wandb is actually enabled in this run.
+        if not any(isinstance(logger, WandbLogger) for logger in self.loggers):
+            return
+
+        wandb.log(data=data, step=step)
+
     def __del__(self):
         for logger in self.loggers:
             logger.finish()
