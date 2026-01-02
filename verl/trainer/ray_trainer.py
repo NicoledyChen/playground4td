@@ -546,7 +546,9 @@ class RayPPOTrainer:
             # ------------------------------------------------------------
             # 2) pass@k (k>=2) using sampling config (defaults to training rollout params)
             # ------------------------------------------------------------
-            max_k = int(getattr(self.config.worker.rollout, "n", 1))
+            # Minimal-intrusion override: use a fixed sampling count for pass@k evaluation.
+            # (User requested n=256; we intentionally do not plumb this through config yet.)
+            max_k = 256
             if max_k >= 2:
                 passk_meta: dict[str, Any] = {
                     "temperature": self.config.worker.rollout.temperature,
@@ -576,15 +578,20 @@ class RayPPOTrainer:
                 pass_ks = list(range(2, passk_repeat + 1))
 
                 # Compute scalar pass@k across the full val set.
-                for k in pass_ks:
-                    per_prompt = []
+                # IMPORTANT: do this in O(num_prompts * n) time (n can be large, e.g. 256).
+                if num_prompts > 0 and passk_repeat > 0:
+                    passk_counts = np.zeros(passk_repeat, dtype=np.float64)  # index j => k=j+1
                     for i in range(num_prompts):
                         start = i * passk_repeat
                         end = start + passk_repeat
-                        group_acc = passk_acc_vals[start:end]
-                        per_prompt.append(1.0 if any(a >= 1.0 for a in group_acc[:k]) else 0.0)
-                    if len(per_prompt) > 0:
-                        metrics[f"val/pass@{k}"] = float(np.mean(per_prompt))
+                        accs = passk_acc_vals[start:end]
+                        succ = np.asarray(accs, dtype=np.float64) >= 1.0
+                        prefix = np.maximum.accumulate(succ).astype(np.float64)  # length n, prefix[k-1] = pass@k
+                        passk_counts += prefix
+
+                    passk_means = passk_counts / float(num_prompts)
+                    for k in pass_ks:
+                        metrics[f"val/pass@{k}"] = float(passk_means[k - 1])
 
                 # Log per-example pass@k table (independent per checkpoint/step).
                 if is_package_available("wandb"):
@@ -607,8 +614,11 @@ class RayPPOTrainer:
                         for j in range(passk_repeat):
                             row.append(outs[j] if j < len(outs) else "")
                             row.append(accs[j] if j < len(accs) else None)
+                        # Fill pass@k columns using a prefix-OR vector (O(n), not O(n^2))
+                        succ = np.asarray(accs, dtype=np.float64) >= 1.0
+                        prefix = np.maximum.accumulate(succ).astype(np.float64)
                         for k in pass_ks:
-                            row.append(1.0 if any(a >= 1.0 for a in accs[:k]) else 0.0)
+                            row.append(float(prefix[k - 1]))
                         data.append(row)
 
                     passk_table = wandb.Table(columns=columns, data=data)
