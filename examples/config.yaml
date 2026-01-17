@@ -9,7 +9,7 @@ data:
   video_fps: 2.0
   max_prompt_length: 1024
   max_response_length: 8192
-  rollout_batch_size: 256  # equivalent to verl's data.train_batch_size
+  rollout_batch_size: 512  # equivalent to verl's data.train_batch_size
   mini_rollout_batch_size: null  # equivalent to verl's data.gen_batch_size
   val_batch_size: 1024
   format_prompt: ./examples/format_prompt/math.jinja
@@ -42,7 +42,6 @@ worker:
     ulysses_size: 1
     model:
       model_path: Qwen/Qwen2.5-7B
-      attn_implementation: "kernels-community/flash-attn3"
       enable_gradient_checkpointing: true
       trust_remote_code: false
       freeze_vision_tower: false
@@ -50,7 +49,7 @@ worker:
       lr: 1.0e-6
       weight_decay: 1.0e-2
       strategy: adamw  # {adamw, adamw_bf16}
-      lr_warmup_ratio: 0.03
+      lr_warmup_ratio: 0.0
     fsdp:
       enable_full_shard: true
       enable_cpu_offload: false
@@ -88,7 +87,7 @@ worker:
     reward_function: ./examples/reward_function/math.py:compute_score
 
 trainer:
-  total_epochs: 90
+  total_epochs: 15
   max_steps: 300
   project_name: easy_r1
   experiment_name: qwen2_5_7b_math_grpo
