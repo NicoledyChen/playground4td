@@ -9,7 +9,7 @@ data:
   video_fps: 2.0
   max_prompt_length: 1024
   max_response_length: 8192
-  rollout_batch_size: 512  # equivalent to verl's data.train_batch_size
+  rollout_batch_size: 256  # equivalent to verl's data.train_batch_size
   mini_rollout_batch_size: null  # equivalent to verl's data.gen_batch_size
   val_batch_size: 1024
   format_prompt: ./examples/format_prompt/math.jinja
@@ -42,6 +42,7 @@ worker:
     ulysses_size: 1
     model:
       model_path: Qwen/Qwen2.5-7B
+      attn_implementation: "kernels-community/flash-attn3"
       enable_gradient_checkpointing: true
       trust_remote_code: false
       freeze_vision_tower: false

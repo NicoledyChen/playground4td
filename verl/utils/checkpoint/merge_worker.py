@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import logging
 import os
 import re
 import shutil
@@ -44,6 +45,25 @@ RAW_FILE_PATTERNS = (
     re.compile(r"optim_world_size_\d+_rank_\d+\.pt$"),
     re.compile(r"extra_state_world_size_\d+_rank_\d+\.pt$"),
 )
+RAW_MODEL_RANK0_PATTERN = re.compile(r"model_world_size_\d+_rank_0\.pt$")
+
+logger = logging.getLogger("merge_worker")
+
+
+class NonRetryableError(RuntimeError):
+    pass
+
+
+def _configure_logging(log_file: Optional[str]) -> None:
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    if log_file:
+        handlers.append(logging.FileHandler(log_file))
+    for handler in handlers:
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
 
 
 def _extract_global_step(tag: str) -> Optional[int]:
@@ -104,6 +124,10 @@ def _protected_tags(
 
 def _is_raw_file(filename: str) -> bool:
     return any(p.match(filename) for p in RAW_FILE_PATTERNS)
+
+
+def _has_raw_model_shard(local_dir: str) -> bool:
+    return any(RAW_MODEL_RANK0_PATTERN.match(name) for name in os.listdir(local_dir))
 
 
 def _cleanup_raw_files(
@@ -212,12 +236,27 @@ def _merge_and_upload_one_component(
     step_dir = os.path.join(save_checkpoint_path, tag)
     local_dir = os.path.join(step_dir, component)
     if not os.path.isdir(local_dir):
-        raise FileNotFoundError(f"Checkpoint component dir not found: {local_dir}")
+        raise NonRetryableError(f"Checkpoint component dir not found: {local_dir}")
 
-    # Merge
-    hf_path = merge_fsdp_checkpoint_to_hf(local_dir)
+    hf_path = os.path.join(local_dir, "huggingface")
+    merge_skipped = False
+    if not _has_raw_model_shard(local_dir):
+        if os.path.isdir(hf_path):
+            merge_skipped = True
+            logger.info("Merge skipped (raw shards missing). Using existing HF folder: %s", hf_path)
+        else:
+            raise NonRetryableError(
+                f"No model shard found in {local_dir} with format `model_world_size_*_rank_0.pt`."
+            )
+    else:
+        # Merge
+        logger.info("Merging checkpoints for tag=%s component=%s", tag, component)
+        hf_path = merge_fsdp_checkpoint_to_hf(local_dir)
 
     upload_info: dict[str, Any] = {"hf_path": hf_path}
+    if merge_skipped:
+        upload_info["merge_skipped"] = True
+        upload_info["merge_skip_reason"] = "raw_shards_missing"
     if hf_repo_id or repo_per_step:
         # Determine target repo_id
         if repo_per_step:
@@ -321,6 +360,7 @@ def _process_task(
     update_task(task_path, {"progress": progress})
 
     multi_component = len(merge_components) > 1
+    logger.info("Processing task tag=%s components=%s", tag, ",".join(merge_components))
 
     # Merge + upload per component
     for comp in merge_components:
@@ -346,6 +386,10 @@ def _process_task(
         comp_prog["merge_finished_at"] = time.time()
         comp_prog["upload"] = info
         update_task(task_path, {"progress": progress})
+        if info.get("uploaded") is True:
+            logger.info("Upload success tag=%s component=%s repo=%s", tag, comp, info.get("repo_id"))
+        else:
+            logger.info("Upload skipped tag=%s component=%s", tag, comp)
 
         # try to reduce resident memory between components
         gc.collect()
@@ -360,10 +404,12 @@ def _process_task(
     cleanup_info: dict[str, Any] = {"skipped": True}
     if delete_after_upload and not uploaded_all:
         cleanup_info = {"skipped": True, "reason": "upload_not_confirmed"}
+        logger.info("Cleanup skipped (upload not confirmed) tag=%s", tag)
     elif delete_raw:
         protected = _protected_tags(save_checkpoint_path, keep_last_n_raw=keep_last_n_raw, keep_best_raw=keep_best_raw)
         if tag in protected:
             cleanup_info = {"skipped": True, "reason": "protected_for_resume", "protected_tags": sorted(protected)}
+            logger.info("Cleanup skipped (protected) tag=%s protected=%s", tag, sorted(protected))
         else:
             # For cleanup, delete raw files for all components under the step directory (actor/critic/...).
             cleanup_info = _cleanup_raw_files(
@@ -373,10 +419,12 @@ def _process_task(
                 remove_empty_dirs=delete_hf_after_upload,
             )
             cleanup_info["skipped"] = False
+            logger.info("Cleanup done tag=%s deleted=%d dirs=%d", tag, len(cleanup_info.get("deleted", [])), len(cleanup_info.get("deleted_dirs", [])))
     progress["cleanup"] = cleanup_info
     update_task(task_path, {"progress": progress, "finished_at": time.time()})
 
     finish_task(queue_dir, task_path, status="done")
+    logger.info("Task done tag=%s", tag)
 
 
 def _try_deferred_cleanup(
@@ -385,6 +433,7 @@ def _try_deferred_cleanup(
     save_checkpoint_path: str,
     keep_last_n_raw: int,
     keep_best_raw: bool,
+    delete_hf_after_upload: bool,
 ) -> int:
     """
     Tasks may skip cleanup when they were the latest checkpoint at processing time.
@@ -414,7 +463,12 @@ def _try_deferred_cleanup(
                 continue
 
             step_dir = os.path.join(save_checkpoint_path, tag)
-            cleanup_info = _cleanup_raw_files(step_dir, components=None)
+            cleanup_info = _cleanup_raw_files(
+                step_dir,
+                components=None,
+                delete_hf_folder=delete_hf_after_upload,
+                remove_empty_dirs=delete_hf_after_upload,
+            )
             cleanup_info["skipped"] = False
             cleanup_info["deferred_cleanup"] = True
             progress["cleanup"] = cleanup_info
@@ -501,13 +555,16 @@ def main() -> None:
     )
     parser.add_argument("--poll_interval_sec", type=float, default=None, help="Poll interval when queue empty.")
     parser.add_argument("--once", action="store_true", help="Process current queue then exit.")
+    parser.add_argument("--log_file", type=str, default=None, help="Optional log file path.")
 
     args = parser.parse_args()
+    _configure_logging(args.log_file)
 
     save_checkpoint_path = os.path.abspath(args.save_checkpoint_path)
     queue_dir = args.queue_dir or os.path.join(save_checkpoint_path, ".merge_queue")
     queue_dir = os.path.abspath(queue_dir)
     ensure_queue_dirs(queue_dir)
+    logger.info("Merge worker started. save_checkpoint_path=%s queue_dir=%s", save_checkpoint_path, queue_dir)
 
     # Load config persisted by training (if any), then override by CLI.
     persisted = read_queue_config(queue_dir) or {}
@@ -580,6 +637,7 @@ def main() -> None:
                     save_checkpoint_path=save_checkpoint_path,
                     keep_last_n_raw=normalized_cfg["keep_last_n_raw"],
                     keep_best_raw=normalized_cfg["keep_best_raw"],
+                    delete_hf_after_upload=normalized_cfg["delete_hf_after_upload"],
                 )
                 break
 
@@ -589,6 +647,7 @@ def main() -> None:
                 save_checkpoint_path=save_checkpoint_path,
                 keep_last_n_raw=normalized_cfg["keep_last_n_raw"],
                 keep_best_raw=normalized_cfg["keep_best_raw"],
+                delete_hf_after_upload=normalized_cfg["delete_hf_after_upload"],
             )
             time.sleep(normalized_cfg["poll_interval_sec"])
             continue
@@ -613,6 +672,14 @@ def main() -> None:
                 delete_hf_after_upload=normalized_cfg["delete_hf_after_upload"],
                 hf_private=normalized_cfg["hf_private"],
             )
+        except NonRetryableError as e:
+            err = str(e)
+            logger.error("Task failed (non-retryable): %s", err)
+            try:
+                update_task(task_path, {"status": "failed", "error": err, "finished_at": time.time()})
+                finish_task(queue_dir, task_path, status="failed", error=err)
+            except Exception:
+                pass
         except Exception as e:
             err = "".join(traceback.format_exception(type(e), e, e.__traceback__))
             try:
@@ -620,6 +687,7 @@ def main() -> None:
                 attempt = int(task.get("attempt", 0))
                 requeue_task(queue_dir, task_path, error=err)
                 backoff = min(600.0, normalized_cfg["poll_interval_sec"] * (2 ** max(0, attempt - 1)))
+                logger.error("Task error; requeued (attempt=%s backoff=%.1fs)", attempt, backoff)
                 time.sleep(backoff)
             except Exception:
                 # last resort: mark failed but do not crash the whole worker
