@@ -439,48 +439,48 @@ class RayPPOTrainer:
             reward_metrics_lst: dict[str, list[Any]] = defaultdict(list)
             length_metrics_lst: dict[str, list[Any]] = defaultdict(list)
 
-            for batch_dict in self.val_dataloader:
-                test_batch = DataProto.from_single_dict(batch_dict)
-                test_gen_batch = test_batch.pop(
-                    batch_keys=["input_ids", "attention_mask", "position_ids"],
-                    non_tensor_batch_keys=["raw_prompt_ids", "multi_modal_data"],
-                )
+        for batch_dict in self.val_dataloader:
+            test_batch = DataProto.from_single_dict(batch_dict)
+            test_gen_batch = test_batch.pop(
+                batch_keys=["input_ids", "attention_mask", "position_ids"],
+                non_tensor_batch_keys=["raw_prompt_ids", "multi_modal_data"],
+            )
 
                 # Always copy to avoid mutating config dicts.
                 test_gen_batch.meta_info = dict(meta_override)
-                test_gen_batch.meta_info["min_pixels"] = self.config.data.min_pixels
-                test_gen_batch.meta_info["max_pixels"] = self.config.data.max_pixels
-                test_gen_batch.meta_info["video_fps"] = self.config.data.video_fps
+            test_gen_batch.meta_info["min_pixels"] = self.config.data.min_pixels
+            test_gen_batch.meta_info["max_pixels"] = self.config.data.max_pixels
+            test_gen_batch.meta_info["video_fps"] = self.config.data.video_fps
 
-                test_gen_batch, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.actor_rollout_ref_wg.world_size)
-                test_output_gen_batch = self.actor_rollout_ref_wg.generate_sequences(test_gen_batch)
-                test_output_gen_batch = unpad_dataproto(test_output_gen_batch, pad_size=pad_size * repeat_times)
+            test_gen_batch, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.actor_rollout_ref_wg.world_size)
+            test_output_gen_batch = self.actor_rollout_ref_wg.generate_sequences(test_gen_batch)
+            test_output_gen_batch = unpad_dataproto(test_output_gen_batch, pad_size=pad_size * repeat_times)
 
                 # repeat to align with repeated responses in rollout (n > 1)
-                test_batch = test_batch.repeat(repeat_times=repeat_times, interleave=True)
-                test_batch = test_batch.union(test_output_gen_batch)
+            test_batch = test_batch.repeat(repeat_times=repeat_times, interleave=True)
+            test_batch = test_batch.union(test_output_gen_batch)
 
-                # evaluate using reward_function
-                reward_tensor, reward_metrics = ray.get(self.val_reward_fn.compute_reward.remote(test_batch))
+            # evaluate using reward_function
+            reward_tensor, reward_metrics = ray.get(self.val_reward_fn.compute_reward.remote(test_batch))
 
                 # store generations (keep original order from rollout)
-                input_ids = test_batch.batch["prompts"]
-                input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
-                output_ids = test_batch.batch["responses"]
-                output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
-                scores = reward_tensor.sum(-1).cpu().tolist()
+            input_ids = test_batch.batch["prompts"]
+            input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
+            output_ids = test_batch.batch["responses"]
+            output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
+            scores = reward_tensor.sum(-1).cpu().tolist()
 
-                sample_inputs.extend(input_texts)
-                sample_outputs.extend(output_texts)
-                sample_labels.extend(test_batch.non_tensor_batch["ground_truth"].tolist())
-                sample_scores.extend(scores)
+            sample_inputs.extend(input_texts)
+            sample_outputs.extend(output_texts)
+            sample_labels.extend(test_batch.non_tensor_batch["ground_truth"].tolist())
+            sample_scores.extend(scores)
 
-                reward_tensor_lst.append(reward_tensor)
-                for key, value in reward_metrics.items():
-                    reward_metrics_lst[key].extend(value)
+            reward_tensor_lst.append(reward_tensor)
+            for key, value in reward_metrics.items():
+                reward_metrics_lst[key].extend(value)
 
-                for key, value in compute_length_metrics(test_batch).items():
-                    length_metrics_lst[key].append(value)
+            for key, value in compute_length_metrics(test_batch).items():
+                length_metrics_lst[key].append(value)
 
             return (
                 repeat_times,
@@ -627,7 +627,7 @@ class RayPPOTrainer:
             print("Finish validation.")
             return metrics
         finally:
-            self.actor_rollout_ref_wg.release_rollout_engine()
+        self.actor_rollout_ref_wg.release_rollout_engine()
 
     def _balance_batch(self, batch: DataProto, metrics: dict[str, Any], logging_prefix: str = "global_seqlen") -> None:
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""

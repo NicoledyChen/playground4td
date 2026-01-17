@@ -201,12 +201,16 @@ class FSDPWorker(Worker):
         else:
             AutoClass = AutoModelForCausalLM
 
+        attn_kwargs = {}
+        if model_config.attn_implementation is not None:
+            attn_kwargs["attn_implementation"] = model_config.attn_implementation
+
         if (not fsdp_config.enable_rank0_init) or self.device_mesh.get_local_rank("fsdp") == 0:
             model = AutoClass.from_pretrained(
                 model_config.model_path,
                 config=self.model_config,
                 torch_dtype=torch_dtype,
-                attn_implementation="flash_attention_2",
+                **attn_kwargs,
                 device_map="cpu" if fsdp_config.enable_rank0_init else "cuda",
                 low_cpu_mem_usage=True,
                 trust_remote_code=model_config.trust_remote_code,
@@ -216,7 +220,7 @@ class FSDPWorker(Worker):
                 model = AutoClass.from_config(
                     self.model_config,
                     torch_dtype=torch_dtype,
-                    attn_implementation="flash_attention_2",
+                    **attn_kwargs,
                     trust_remote_code=model_config.trust_remote_code,
                 )
 

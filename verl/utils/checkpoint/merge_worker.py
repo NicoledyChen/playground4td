@@ -19,6 +19,7 @@ import gc
 import json
 import os
 import re
+import shutil
 import time
 import traceback
 from typing import Any, Optional
@@ -29,6 +30,7 @@ from .auto_merge_queue import (
     finish_task,
     load_task,
     read_queue_config,
+    requeue_task,
     recover_running_to_pending,
     update_task,
     write_queue_config,
@@ -90,7 +92,7 @@ def _protected_tags(
     tracker = _load_checkpoint_tracker(save_checkpoint_path)
     if tracker is not None:
         last = tracker.get("last_global_step")
-        if isinstance(last, int):
+        if isinstance(last, int) and keep_last_n_raw > 0:
             protected.add(f"global_step_{last}")
         if keep_best_raw:
             best = tracker.get("best_global_step")
@@ -104,13 +106,20 @@ def _is_raw_file(filename: str) -> bool:
     return any(p.match(filename) for p in RAW_FILE_PATTERNS)
 
 
-def _cleanup_raw_files(step_dir: str, *, components: Optional[list[str]] = None) -> dict[str, Any]:
+def _cleanup_raw_files(
+    step_dir: str,
+    *,
+    components: Optional[list[str]] = None,
+    delete_hf_folder: bool = False,
+    remove_empty_dirs: bool = False,
+) -> dict[str, Any]:
     """
     Delete raw shard/optimizer files for the given components under a step folder.
     Returns stats dict.
     """
 
     deleted: list[str] = []
+    deleted_dirs: list[str] = []
     missing_components: list[str] = []
 
     if components is None:
@@ -135,6 +144,17 @@ def _cleanup_raw_files(step_dir: str, *, components: Optional[list[str]] = None)
                 deleted.append(fpath)
             except FileNotFoundError:
                 continue
+        if delete_hf_folder:
+            hf_dir = os.path.join(comp_dir, "huggingface")
+            if os.path.isdir(hf_dir):
+                shutil.rmtree(hf_dir, ignore_errors=True)
+                deleted_dirs.append(hf_dir)
+        if remove_empty_dirs and os.path.isdir(comp_dir) and not os.listdir(comp_dir):
+            try:
+                os.rmdir(comp_dir)
+                deleted_dirs.append(comp_dir)
+            except OSError:
+                pass
 
     # also remove dataloader state if present (it's only used for resume)
     dataloader_path = os.path.join(step_dir, "dataloader.pt")
@@ -145,7 +165,19 @@ def _cleanup_raw_files(step_dir: str, *, components: Optional[list[str]] = None)
         except FileNotFoundError:
             pass
 
-    return {"deleted": deleted, "cleaned_components": cleaned_components, "missing_components": missing_components}
+    if remove_empty_dirs and os.path.isdir(step_dir) and not os.listdir(step_dir):
+        try:
+            os.rmdir(step_dir)
+            deleted_dirs.append(step_dir)
+        except OSError:
+            pass
+
+    return {
+        "deleted": deleted,
+        "deleted_dirs": deleted_dirs,
+        "cleaned_components": cleaned_components,
+        "missing_components": missing_components,
+    }
 
 
 def _format_template(template: str, *, tag: str, component: str, hf_repo_id: Optional[str] = None) -> str:
@@ -268,6 +300,8 @@ def _process_task(
     keep_last_n_raw: int,
     keep_best_raw: bool,
     delete_raw: bool,
+    delete_after_upload: bool,
+    delete_hf_after_upload: bool,
     hf_private: bool,
 ) -> None:
     task = load_task(task_path)
@@ -316,16 +350,28 @@ def _process_task(
         # try to reduce resident memory between components
         gc.collect()
 
+    uploaded_all = all(
+        progress.get("components", {}).get(comp, {}).get("upload", {}).get("uploaded") is True
+        for comp in merge_components
+    )
+
     # Cleanup raw files (for non-protected checkpoints)
     step_dir = os.path.join(save_checkpoint_path, tag)
     cleanup_info: dict[str, Any] = {"skipped": True}
-    if delete_raw:
+    if delete_after_upload and not uploaded_all:
+        cleanup_info = {"skipped": True, "reason": "upload_not_confirmed"}
+    elif delete_raw:
         protected = _protected_tags(save_checkpoint_path, keep_last_n_raw=keep_last_n_raw, keep_best_raw=keep_best_raw)
         if tag in protected:
             cleanup_info = {"skipped": True, "reason": "protected_for_resume", "protected_tags": sorted(protected)}
         else:
             # For cleanup, delete raw files for all components under the step directory (actor/critic/...).
-            cleanup_info = _cleanup_raw_files(step_dir, components=None)
+            cleanup_info = _cleanup_raw_files(
+                step_dir,
+                components=None,
+                delete_hf_folder=delete_hf_after_upload,
+                remove_empty_dirs=delete_hf_after_upload,
+            )
             cleanup_info["skipped"] = False
     progress["cleanup"] = cleanup_info
     update_task(task_path, {"progress": progress, "finished_at": time.time()})
@@ -429,6 +475,18 @@ def main() -> None:
     parser.add_argument("--keep_best_raw", type=int, default=None, help="1/0. Keep best raw checkpoint too.")
     parser.add_argument("--delete_raw", type=int, default=None, help="1/0. Delete raw files after merge (default: 1).")
     parser.add_argument(
+        "--delete_after_upload",
+        type=int,
+        default=None,
+        help="1/0. Only cleanup local checkpoints after upload succeeds (default: 0).",
+    )
+    parser.add_argument(
+        "--delete_hf_after_upload",
+        type=int,
+        default=None,
+        help="1/0. Delete merged Hugging Face folders after successful upload (default: 0).",
+    )
+    parser.add_argument(
         "--hf_path_in_repo_template",
         type=str,
         default=None,
@@ -472,6 +530,10 @@ def main() -> None:
         overrides["keep_best_raw"] = bool(int(args.keep_best_raw))
     if args.delete_raw is not None:
         overrides["delete_raw"] = bool(int(args.delete_raw))
+    if args.delete_after_upload is not None:
+        overrides["delete_after_upload"] = bool(int(args.delete_after_upload))
+    if args.delete_hf_after_upload is not None:
+        overrides["delete_hf_after_upload"] = bool(int(args.delete_hf_after_upload))
     if args.update_latest is not None:
         overrides["update_latest"] = bool(int(args.update_latest))
     if args.keep_last_n_raw is not None:
@@ -499,6 +561,8 @@ def main() -> None:
         "keep_last_n_raw": int(cfg.get("keep_last_n_raw", 1)),
         "keep_best_raw": bool(cfg.get("keep_best_raw", True)),
         "delete_raw": bool(cfg.get("delete_raw", True)),
+        "delete_after_upload": bool(cfg.get("delete_after_upload", False)),
+        "delete_hf_after_upload": bool(cfg.get("delete_hf_after_upload", False)),
         "poll_interval_sec": float(cfg.get("poll_interval_sec", 30.0)),
     }
     write_queue_config(queue_dir, normalized_cfg)
@@ -545,16 +609,25 @@ def main() -> None:
                 keep_last_n_raw=normalized_cfg["keep_last_n_raw"],
                 keep_best_raw=normalized_cfg["keep_best_raw"],
                 delete_raw=normalized_cfg["delete_raw"],
+                delete_after_upload=normalized_cfg["delete_after_upload"],
+                delete_hf_after_upload=normalized_cfg["delete_hf_after_upload"],
                 hf_private=normalized_cfg["hf_private"],
             )
         except Exception as e:
             err = "".join(traceback.format_exception(type(e), e, e.__traceback__))
             try:
-                update_task(task_path, {"status": "failed", "error": err, "finished_at": time.time()})
-                finish_task(queue_dir, task_path, status="failed", error=err)
+                task = load_task(task_path)
+                attempt = int(task.get("attempt", 0))
+                requeue_task(queue_dir, task_path, error=err)
+                backoff = min(600.0, normalized_cfg["poll_interval_sec"] * (2 ** max(0, attempt - 1)))
+                time.sleep(backoff)
             except Exception:
-                # last resort: do not crash the whole worker
-                pass
+                # last resort: mark failed but do not crash the whole worker
+                try:
+                    update_task(task_path, {"status": "failed", "error": err, "finished_at": time.time()})
+                    finish_task(queue_dir, task_path, status="failed", error=err)
+                except Exception:
+                    pass
         finally:
             gc.collect()
 

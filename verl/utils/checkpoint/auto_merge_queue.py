@@ -221,3 +221,22 @@ def finish_task(queue_dir: str, task_path: str, *, status: str, error: Optional[
     return dst
 
 
+def requeue_task(queue_dir: str, task_path: str, *, error: Optional[str] = None) -> str:
+    """
+    Move a running task back to pending for retry.
+    """
+    ensure_queue_dirs(queue_dir)
+    lock = FileLock(queue_lock_path(queue_dir), timeout=60)
+    with lock:
+        task = load_task(task_path)
+        task["status"] = "pending"
+        task["updated_at"] = _now_ts()
+        if error:
+            task["error"] = error
+        _atomic_write_json(task_path, task)
+
+        fname = os.path.basename(task_path)
+        dst = os.path.join(queue_dir, "pending", fname)
+        os.replace(task_path, dst)
+        return dst
+

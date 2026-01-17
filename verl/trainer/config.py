@@ -214,6 +214,12 @@ class TrainerConfig:
         delete_raw: bool = True
         """After successful merge (+ optional upload), delete raw shard/optimizer files for non-protected checkpoints."""
 
+        delete_after_upload: bool = False
+        """Only clean local checkpoints after a successful upload."""
+
+        delete_hf_after_upload: bool = False
+        """Delete merged Hugging Face folders after a successful upload."""
+
         poll_interval_sec: float = 30.0
         """Worker poll interval (seconds) when the queue is empty. Stored for convenience."""
 

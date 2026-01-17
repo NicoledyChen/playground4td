@@ -13,7 +13,8 @@ Example:
   python scripts/batch_merge_upload_checkpoints.py \
     --save_checkpoint_path checkpoints/easy_r1/exp_name \
     --hf_repo_id org/model \
-    --hf_path_in_repo_template "checkpoints/{tag}/{component}"
+    --repo_per_step \
+    --hf_repo_id_per_step_template "{hf_repo_id}-step-{step}"
 """
 
 from __future__ import annotations
@@ -116,10 +117,25 @@ def main() -> int:
     ap.add_argument("--save_checkpoint_path", required=True, type=str, help="e.g. checkpoints/<proj>/<exp>")
     ap.add_argument("--hf_repo_id", required=True, type=str, help="HF repo id like `org/model`")
     ap.add_argument(
+        "--repo_per_step",
+        action="store_true",
+        help="If set, upload each checkpoint into its own HF repo (repo name derived from step).",
+    )
+    ap.add_argument(
+        "--hf_repo_id_per_step_template",
+        type=str,
+        default="{hf_repo_id}-step-{step}",
+        help="Repo id template when --repo_per_step is set. Fields: {hf_repo_id},{tag},{step},{step_padded}.",
+    )
+    ap.add_argument(
         "--hf_path_in_repo_template",
         type=str,
-        default="checkpoints/{tag}/{component}",
-        help="Upload path template inside repo. Fields: {tag},{step},{step_padded},{component}.",
+        default="",
+        help=(
+            "Upload path template inside repo. Fields: {tag},{step},{step_padded},{component}. "
+            "Default: repo root (single-component) or {component} (multi-component) when --repo_per_step; "
+            "otherwise default is checkpoints/{tag}/{component}."
+        ),
     )
     ap.add_argument("--hf_private", action="store_true", help="Create repo as private (if creating).")
     ap.add_argument(
@@ -167,6 +183,21 @@ def main() -> int:
 
             print(f"[batch-merge] {tag}: components={comps}")
             processed_components: list[str] = []
+            multi_component = len(comps) > 1
+
+            # Determine upload target repo for this step.
+            if args.repo_per_step:
+                repo_id = args.hf_repo_id_per_step_template.format(
+                    hf_repo_id=args.hf_repo_id,
+                    tag=tag,
+                    step=s.step,
+                    step_padded=f"{s.step:08d}",
+                )
+                # Default path_in_repo: root for single-component; {component} for multi-component.
+                base_path_in_repo = None if not multi_component else "{component}"
+            else:
+                repo_id = args.hf_repo_id
+                base_path_in_repo = "checkpoints/{tag}/{component}"
 
             for comp in comps:
                 local_dir = os.path.join(step_dir, comp)
@@ -197,13 +228,17 @@ def main() -> int:
                     print(f"[batch-merge]  - {comp}: already merged (found weights), skip merge")
 
                 # Upload
-                path_in_repo = _format_path_in_repo(args.hf_path_in_repo_template, tag=tag, step=s.step, component=comp)
+                path_template = args.hf_path_in_repo_template
+                if not path_template:
+                    path_template = base_path_in_repo or ""
+
+                path_in_repo = _format_path_in_repo(path_template, tag=tag, step=s.step, component=comp) if path_template else ""
                 if path_in_repo == "":
                     path_in_repo = None
-                print(f"[batch-merge]  - {comp}: uploading to {args.hf_repo_id}::{path_in_repo or '/'}")
+                print(f"[batch-merge]  - {comp}: uploading to {repo_id}::{path_in_repo or '/'}")
                 upload_folder_to_huggingface(
                     local_path=hf_path,
-                    repo_id=args.hf_repo_id,
+                    repo_id=repo_id,
                     path_in_repo=path_in_repo,
                     private=bool(args.hf_private),
                     commit_message=f"batch-merge {tag} ({comp})",

@@ -25,11 +25,15 @@ class ModelConfig:
     model_path: Optional[str] = None
     tokenizer_path: Optional[str] = None
     override_config: dict[str, Any] = field(default_factory=dict)
+    attn_implementation: Optional[str] = "flash_attention_2"
     enable_gradient_checkpointing: bool = True
     trust_remote_code: bool = True
     freeze_vision_tower: bool = False
 
     def post_init(self):
+        if self.attn_implementation == "":
+            self.attn_implementation = None
+
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path
 

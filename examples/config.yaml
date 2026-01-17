@@ -1,5 +1,5 @@
 data:
-  train_files: nicoledy/limr
+  train_files: nicoledy/deepscaler-4k
   val_files: nicoledy/aime2024
   prompt_key: problem
   answer_key: answer
@@ -7,9 +7,9 @@ data:
   video_key: videos
   image_dir: null
   video_fps: 2.0
-  max_prompt_length: 2569
+  max_prompt_length: 1024
   max_response_length: 8192
-  rollout_batch_size: 512  # equivalent to verl's data.train_batch_size
+  rollout_batch_size: 256  # equivalent to verl's data.train_batch_size
   mini_rollout_batch_size: null  # equivalent to verl's data.gen_batch_size
   val_batch_size: 1024
   format_prompt: ./examples/format_prompt/math.jinja
@@ -25,7 +25,7 @@ algorithm:
   disable_kl: false
   use_kl_loss: true
   kl_penalty: low_var_kl
-  kl_coef: 1.0e-2
+  kl_coef: 1.0e-3
   online_filtering: false  # dapo filter groups
   filter_key: overall
   filter_low: 0.01
@@ -33,15 +33,16 @@ algorithm:
 
 worker:
   actor:
-    global_batch_size: 128  # equivalent to verl's actor.ppo_mini_batch_size
-    micro_batch_size_per_device_for_update: 1  # equivalent to verl's actor.ppo_micro_batch_size_per_gpu
-    micro_batch_size_per_device_for_experience: 2  # equivalent to verl's rollout.log_prob_micro_batch_size_per_gpu
+    global_batch_size: 64  # equivalent to verl's actor.ppo_mini_batch_size
+    micro_batch_size_per_device_for_update: 2  # equivalent to verl's actor.ppo_micro_batch_size_per_gpu
+    micro_batch_size_per_device_for_experience: 8  # equivalent to verl's rollout.log_prob_micro_batch_size_per_gpu
     max_grad_norm: 1.0
     padding_free: true
     dynamic_batching: true
     ulysses_size: 1
     model:
-      model_path: Qwen/Qwen2.5-7B-Instruct
+      model_path: Qwen/Qwen2.5-7B
+      attn_implementation: "kernels-community/flash-attn3"
       enable_gradient_checkpointing: true
       trust_remote_code: false
       freeze_vision_tower: false
@@ -49,7 +50,7 @@ worker:
       lr: 1.0e-6
       weight_decay: 1.0e-2
       strategy: adamw  # {adamw, adamw_bf16}
-      lr_warmup_ratio: 0.0
+      lr_warmup_ratio: 0.03
     fsdp:
       enable_full_shard: true
       enable_cpu_offload: false
@@ -67,6 +68,8 @@ worker:
     enforce_eager: false
     enable_chunked_prefill: false
     tensor_parallel_size: 1
+    max_model_len: 16384
+    max_num_batched_tokens: 16384
     disable_tqdm: false
     val_override_config:
       temperature: 0
@@ -85,8 +88,8 @@ worker:
     reward_function: ./examples/reward_function/math.py:compute_score
 
 trainer:
-  total_epochs: 15
-  max_steps: null
+  total_epochs: 90
+  max_steps: 300
   project_name: easy_r1
   experiment_name: qwen2_5_7b_math_grpo
   logger: ["file", "wandb"]
@@ -105,7 +108,7 @@ trainer:
   find_last_checkpoint: true
   auto_merge:
     enabled: true
-    hf_repo_id: qwen2.5-7b-instruct-limr
+    hf_repo_id: qwen2.5-7b-deepscaler-4k
     repo_per_step: true
     hf_repo_id_per_step_template: "{hf_repo_id}-step-{step}"
     hf_latest_repo_id: null
@@ -114,5 +117,7 @@ trainer:
     hf_latest_path_in_repo_template: "latest/{component}"
     merge_components: ["actor"]
     keep_last_n_raw: 1
-    keep_best_raw: true
+    keep_best_raw: false
     delete_raw: true
+    delete_after_upload: true
+    delete_hf_after_upload: true
